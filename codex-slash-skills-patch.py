@@ -56,6 +56,7 @@ ENTITLEMENTS_XML = """<?xml version="1.0" encoding="UTF-8"?>
 MARKER_CODEX = "function id_slash_skills("
 MARKER_WORK = 'triggers:["/","@"],requiresEmptyComposer:!1,Icon:{assets:{16:n2.S,20:n3.Z}}'
 MARKER_BROWSER = 'searchAliases:[e.name],triggers:["/","@","$"],requiresEmptyComposer:!1'
+MARKER_PIPE = '{authorized:!0}/*codex-slash-patch-pipe*/'
 
 
 def default_app_path() -> Path:
@@ -132,6 +133,30 @@ def find_target_chunks(asar_path: Path, base: int, assets: dict) -> dict:
             if all(targets.values()):
                 break
     return targets
+
+
+def find_pipe_chunk(asar_path: Path, base: int, build_files: dict) -> str | None:
+    with open(asar_path, "rb") as f:
+        for name, meta in build_files.items():
+            if not name.endswith(".js") or "offset" not in meta:
+                continue
+            f.seek(base + int(meta["offset"]))
+            blob = f.read(meta["size"])
+            if b"browser-use-peer-authorization.node" in blob:
+                return name
+    return None
+
+
+def patch_native_pipe_auth(src: str) -> tuple[str, bool]:
+    if MARKER_PIPE in src:
+        return src, False
+    old = 'return null==s?{authorized:!1,reason:"missing-socket-file-descriptor"}:e.authorizeSocketPeer(s,n)'
+    if src.count(old) != 1:
+        raise RuntimeError(
+            f"Unsupported native pipe authorizer structure (expected 1 match, got {src.count(old)})."
+        )
+    new = f'return null==s?{{authorized:!1,reason:"missing-socket-file-descriptor"}}:{MARKER_PIPE}'
+    return src.replace(old, new, 1), True
 
 
 def patch_codex_composer(src: str) -> tuple[str, bool]:
@@ -322,7 +347,9 @@ def cmd_status(args) -> int:
     asar_path = app_path / "Contents/Resources/app.asar"
     tree, header_bytes, base, _ = read_asar_index(asar_path)
     assets = tree["files"]["webview"]["files"]["assets"]["files"]["async"]["files"]
+    build_files = tree["files"][".vite"]["files"]["build"]["files"]
     targets = find_target_chunks(asar_path, base, assets)
+    pipe_chunk = find_pipe_chunk(asar_path, base, build_files)
     checks = {}
     for key, marker in (("codex", MARKER_CODEX), ("work", MARKER_WORK), ("browser", MARKER_BROWSER)):
         fname = targets[key]
@@ -331,6 +358,11 @@ def cmd_status(args) -> int:
         else:
             text = read_asar_entry(asar_path, base, assets[fname]).decode("utf-8", "replace")
             checks[key] = f"patched ({fname})" if marker in text else f"unpatched ({fname})"
+    if pipe_chunk is None:
+        checks["pipe"] = "not-found"
+    else:
+        ptxt = read_asar_entry(asar_path, base, build_files[pipe_chunk]).decode("utf-8", "replace")
+        checks["pipe"] = f"patched ({pipe_chunk})" if MARKER_PIPE in ptxt else f"unpatched ({pipe_chunk})"
     _, fw_bin, _ = find_framework_binary(app_path)
     fuse = read_fuse_byte(fw_bin)
     with open(app_path / "Contents/Info.plist", "rb") as f:
@@ -345,6 +377,7 @@ def cmd_status(args) -> int:
     print(f"Codex composer : {checks['codex']}")
     print(f"Work composer  : {checks['work']}")
     print(f"Browser skills : {checks['browser']}")
+    print(f"Native pipes   : {checks['pipe']}")
     print(f"ASAR header    : {'ok' if plist_hash == actual_hash else 'mismatch'}")
     print(f"ASAR fuse bit  : {fuse} (1=enforced, 0=disabled)")
     print(f"Code signature : {read_codesign_summary(app_path)}")
@@ -359,41 +392,62 @@ def patch_staged_bundle(stage_path: Path, sign_request: str, dry_run: bool) -> N
 
     tree, _, old_base, old_payload_size = read_asar_index(asar_path)
     assets = tree["files"]["webview"]["files"]["assets"]["files"]["async"]["files"]
+    build_files = tree["files"][".vite"]["files"]["build"]["files"]
     targets = find_target_chunks(asar_path, old_base, assets)
+    pipe_chunk = find_pipe_chunk(asar_path, old_base, build_files)
     missing = [k for k, v in targets.items() if v is None]
     if missing:
         raise RuntimeError(f"Could not locate required webview chunks: {missing}")
 
     patch_specs = [
-        ("codex", targets["codex"], patch_codex_composer),
-        ("work", targets["work"], patch_work_composer),
-        ("browser", targets["browser"], patch_browser_skills),
+        ("codex", assets, targets["codex"], patch_codex_composer, ".mjs"),
+        ("work", assets, targets["work"], patch_work_composer, ".mjs"),
+        ("browser", assets, targets["browser"], patch_browser_skills, ".mjs"),
     ]
+    if pipe_chunk is not None:
+        patch_specs.append(("pipe", build_files, pipe_chunk, patch_native_pipe_auth, ".cjs"))
 
     node_bin = find_node_binary()
     appended_blobs = []
     cur_offset = old_payload_size
     any_changed = False
+    pipe_changed = False
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        for label, fname, fn in patch_specs:
-            meta = assets[fname]
+        for label, container, fname, fn, ext in patch_specs:
+            meta = container[fname]
             orig_bytes = read_asar_entry(asar_path, old_base, meta)
             patched_text, changed = fn(orig_bytes.decode("utf-8"))
             patched_bytes = patched_text.encode("utf-8")
             if node_bin:
-                tmp_js = Path(tmpdir) / f"{fname}.mjs"
+                tmp_js = Path(tmpdir) / f"{fname}{ext}"
                 tmp_js.write_bytes(patched_bytes)
                 subprocess.run([node_bin, "--check", str(tmp_js)], check=True)
             status = "patched" if changed else "already patched"
             print(f"  [{label}] {fname}: {status} ({len(orig_bytes)} -> {len(patched_bytes)} bytes)")
             if changed:
                 any_changed = True
+                if label == "pipe":
+                    pipe_changed = True
                 meta["size"] = len(patched_bytes)
                 meta["offset"] = str(cur_offset)
                 meta["integrity"] = compute_integrity(patched_bytes)
                 cur_offset += len(patched_bytes)
                 appended_blobs.append(patched_bytes)
+
+        if pipe_changed and pipe_chunk is not None and ".owl-cjs-cache.json" in tree["files"]:
+            cache_meta = tree["files"][".owl-cjs-cache.json"]
+            cache_map = json.loads(read_asar_entry(asar_path, old_base, cache_meta).decode("utf-8"))
+            cache_key = f".vite/build/{pipe_chunk}"
+            if cache_key in cache_map:
+                del cache_map[cache_key]
+                cache_bytes = json.dumps(cache_map, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                cache_meta["size"] = len(cache_bytes)
+                cache_meta["offset"] = str(cur_offset)
+                cache_meta["integrity"] = compute_integrity(cache_bytes)
+                cur_offset += len(cache_bytes)
+                appended_blobs.append(cache_bytes)
+                print(f"  Invalidated V8 bytecode cache entry for {cache_key}")
 
         if dry_run:
             print("Dry-run succeeded. No files were modified.")
@@ -480,10 +534,16 @@ def cmd_apply(args) -> int:
     asar_path = app_path / "Contents/Resources/app.asar"
     tree, _, base, _ = read_asar_index(asar_path)
     assets = tree["files"]["webview"]["files"]["assets"]["files"]["async"]["files"]
+    build_files = tree["files"][".vite"]["files"]["build"]["files"]
     targets = find_target_chunks(asar_path, base, assets)
+    pipe_chunk = find_pipe_chunk(asar_path, base, build_files)
     already_patched = (
         targets["codex"] is not None
         and MARKER_CODEX in read_asar_entry(asar_path, base, assets[targets["codex"]]).decode("utf-8", "replace")
+        and (
+            pipe_chunk is None
+            or MARKER_PIPE in read_asar_entry(asar_path, base, build_files[pipe_chunk]).decode("utf-8", "replace")
+        )
     )
     if already_patched:
         print("This app bundle is already patched. Nothing to do.")

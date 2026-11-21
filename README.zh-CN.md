@@ -70,15 +70,17 @@ python3 codex-slash-skills-patch.py apply --sign -
 
 ## 补丁修改内容
 
-脚本会在临时副本中完成以下四步操作，校验通过后再原子替换目标应用。
+脚本会在临时副本中完成以下五步操作，校验通过后再原子替换目标应用。
 
 1. **Codex 工作区输入框（动态定位包含 `composer.planSkillSlashCommand.title` 的异步模块）**
    新增 `id_slash_skills` 组件，读取当前工作区全部已启用技能并注册至斜杠命令表（`triggers: ["/"]`、`group: "Skills"`），同时配置弹窗点击与行内 `/xxx` 替换回调。
 2. **通用对话与浏览器技能模块**
    为已有技能注册逻辑补充 `/` 触发符、原始名称搜索别名与 `onSelectFromInlineSlash` 行内替换回调。
-3. **归档完整性更新**
-   将修改后的 3 个脚本追加写入 `Contents/Resources/app.asar`，更新对应文件与归档头的 SHA-256 校验值，同步写入 `Contents/Info.plist`，并关闭 `Codex Framework` 内嵌的 ASAR 强校验开关位。
-4. **本地重签与校验**
+3. **本地管道鉴权兼容**
+   更新主进程 `.vite/build/early-bootstrap-*.js` 中的本地 Unix Socket 对端校验并清理其 V8 字节码缓存条目，使本地重签后 `codex_app` 工具与浏览器控制扩展继续正常工作。
+4. **归档完整性更新**
+   将修改后的脚本追加写入 `Contents/Resources/app.asar`，更新对应文件与归档头的 SHA-256 校验值，同步写入 `Contents/Info.plist`，并关闭 `Codex Framework` 内嵌的 ASAR 强校验开关位。
+5. **本地重签与校验**
    为 8 个辅助进程、`Codex Framework.framework` 及主程序 `.app` 统一重签，并通过 `codesign --verify --verbose=2` 校验后原子替换。
 
 ## 注意事项

@@ -64,8 +64,9 @@ Quit (`Cmd+Q`) and reopen the app to return to the untouched Apple-signed bundle
 
 1. Dynamically locates the three webview async JS chunks inside `Contents/Resources/app.asar` using stable string anchors.
 2. Adds a `Skills` slash-command registrar (`id_slash_skills`) to the Codex composer chunk and adds `"/"` plus `onSelectFromInlineSlash` to the Work composer and Browser Skills chunks.
-3. Appends the patched JS files to `app.asar`, recalculates per-file and archive-header SHA-256 hashes, updates `Contents/Info.plist`, and flips the Electron embedded ASAR integrity fuse bit in `Codex Framework`.
-4. Re-signs the helpers, `Codex Framework.framework`, and main `.app` bundle with a single consistent identity, verifies with `codesign --verify --verbose=2`, and swaps the bundle atomically.
+3. Updates the local Unix-socket peer authorizer in `.vite/build/early-bootstrap-*.js` (and invalidates its V8 bytecode cache entry) so `codex_app` tools and Browser Control continue working after local re-signing.
+4. Appends the patched JS files to `app.asar`, recalculates per-file and archive-header SHA-256 hashes, updates `Contents/Info.plist`, and flips the Electron embedded ASAR integrity fuse bit in `Codex Framework`.
+5. Re-signs the helpers, `Codex Framework.framework`, and main `.app` bundle with a single consistent identity, verifies with `codesign --verify --verbose=2`, and swaps the bundle atomically.
 
 ## Notes
 
